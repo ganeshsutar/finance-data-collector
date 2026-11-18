@@ -47,18 +47,41 @@ uv run finance-data-collector
 uv run finance-data-collector --once
 
 # Only some symbols, every 60 seconds
-uv run finance-data-collector --symbols NIFTY BANKNIFTY ABB --interval 60
+uv run finance-data-collector -s NIFTY -s BANKNIFTY -s ABB --interval 60
+
+# All options
+uv run finance-data-collector --help
 ```
 
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--out` | `data` | Output folder |
-| `--symbols` | all | Only these symbols |
+| `--symbol`, `-s` | all | Only this symbol; repeat for more |
 | `--interval` | `300` | Seconds between cycle starts. If a cycle runs longer than this, the next one starts right after it. |
 | `--delay` | `1.0` | Pause between requests, so NSE doesn't block you |
-| `--once` | off | Run a single cycle and exit |
+| `--once` | off | Run a single cycle and exit (exit code 1 if every symbol failed) |
 | `--ignore-market-hours` | off | Also run outside market hours |
-| `-v` | off | Debug logging |
+| `--log-dir` | `logs` | Folder for the log file |
+| `--verbose`, `-v` | off | Show debug messages on screen too |
+
+While it runs, the terminal shows a progress bar for each cycle and a summary table
+(saved / unchanged / skipped / failed) when the cycle ends. Stop it with Ctrl+C or `kill`.
+
+## Log file
+
+Everything is also written to `logs/collector.log` so you can check a run afterwards:
+
+- the settings each run started with, and when it stopped
+- one line per saved snapshot: symbol, expiry, strike count, NSE's data time and file path
+- unchanged / skipped symbols, each retry, and each failure with its error
+- a summary line per cycle, naming any failed symbols
+
+The file rotates at midnight (`collector.log.2026-11-18`, ...), and the last 30 days are kept.
+To find problems quickly:
+
+```bash
+grep -E "WARNING|ERROR" logs/collector.log
+```
 
 ## Reading the files
 

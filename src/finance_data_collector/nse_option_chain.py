@@ -8,12 +8,13 @@ button on https://www.nseindia.in/option-chain (nearest expiry).
 
 from __future__ import annotations
 
-import argparse
 import csv
 import logging
 import lzma
 import os
 import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import datetime, time as dtime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -92,11 +93,11 @@ class NSEClient:
         self._warm = True
 
     def get_json(self, path: str, params: dict | None = None, retries: int = 3):
-        if not self._warm:
-            self.warm_up()
         last_err: Exception | None = None
         for attempt in range(1, retries + 1):
             try:
+                if not self._warm:
+                    self.warm_up()
                 r = self.session.get(
                     f"{BASE_URL}{path}", params=params, timeout=self.timeout
                 )
@@ -106,9 +107,10 @@ class NSEClient:
                 return r.json()
             except (requests.RequestException, ValueError) as e:
                 last_err = e
-                log.debug("GET %s %s failed (attempt %d): %s", path, params, attempt, e)
-                time.sleep(2 * attempt)
-                self.warm_up()  # fresh cookies before retrying
+                log.warning("GET %s %s failed (attempt %d/%d): %s", path, params or "", attempt, retries, e)
+                self._warm = False  # fetch fresh cookies before the next attempt
+                if attempt < retries:
+                    time.sleep(2 * attempt)
         raise RuntimeError(f"GET {path} {params} failed: {last_err}")
 
     def fno_stocks(self) -> list[str]:
@@ -173,83 +175,72 @@ class Collector:
         self._expiry_cache[symbol] = (today, exps[0])
         return exps[0]
 
-    def collect_one(self, symbol: str) -> Path | None:
+    def collect_one(self, symbol: str) -> tuple[str, str]:
+        """Returns (status, detail); status is "saved", "unchanged" or "skipped"."""
         now = datetime.now(IST)
         today = now.strftime("%Y-%m-%d")
         expiry = self.nearest_expiry(symbol, today)
         if not expiry:
             log.warning("%s: no expiries listed, skipping", symbol)
-            return None
+            return "skipped", "no expiries listed"
         chain = self.client.option_chain(symbol, expiry)
         nse_ts = chain.get("records", {}).get("timestamp", "")
         if nse_ts and self._last_ts.get(symbol) == nse_ts:
             log.info("%s: data unchanged since %s, not saved", symbol, nse_ts)
-            return None
+            return "unchanged", nse_ts
         rows = to_rows(chain)
         if not rows:
             log.warning("%s: empty option chain for %s", symbol, expiry)
-            return None
+            return "skipped", f"empty chain for {expiry}"
         path = self.out_dir / symbol / today / f"{now:%Y-%m-%d_%H-%M-%S}.csv.xz"
         write_csv_xz(path, rows)
         self._last_ts[symbol] = nse_ts
-        log.info("%s %s: %d strikes -> %s", symbol, expiry, len(rows), path)
-        return path
+        log.info("%s %s: %d strikes (NSE time %s) -> %s", symbol, expiry, len(rows), nse_ts, path)
+        return "saved", str(path)
 
-    def run_cycle(self) -> tuple[int, int]:
+    def run_cycle(
+        self,
+        on_start: Callable[[int], None] | None = None,
+        on_symbol: Callable[[str], None] | None = None,
+    ) -> CycleResult:
+        """Collect every symbol once. The callbacks receive the symbol count and
+        each finished symbol (the CLI uses them for its progress bar)."""
+        result = CycleResult(started=datetime.now(IST))
         symbols = self.symbols()
-        ok = failed = 0
+        result.total = len(symbols)
+        if on_start:
+            on_start(len(symbols))
         log.info("Cycle start: %d symbols", len(symbols))
         for sym in symbols:
             try:
-                if self.collect_one(sym):
-                    ok += 1
+                status, _ = self.collect_one(sym)
+                setattr(result, status, getattr(result, status) + 1)
             except Exception as e:  # keep going; one bad symbol must not stop the run
-                failed += 1
+                result.failed[sym] = str(e)
                 log.error("%s: %s", sym, e)
+            if on_symbol:
+                on_symbol(sym)
             time.sleep(self.delay)
-        log.info("Cycle done: %d saved, %d failed", ok, failed)
-        return ok, failed
+        result.seconds = (datetime.now(IST) - result.started).total_seconds()
+        log.info(
+            "Cycle done in %.0fs: %d saved, %d unchanged, %d skipped, %d failed%s",
+            result.seconds, result.saved, result.unchanged, result.skipped,
+            len(result.failed),
+            f" ({', '.join(result.failed)})" if result.failed else "",
+        )
+        return result
+
+
+@dataclass
+class CycleResult:
+    started: datetime
+    total: int = 0
+    saved: int = 0
+    unchanged: int = 0
+    skipped: int = 0
+    failed: dict[str, str] = field(default_factory=dict)  # symbol -> error
+    seconds: float = 0.0
 
 
 def market_open(now: datetime) -> bool:
     return now.weekday() < 5 and MARKET_OPEN <= now.time() <= MARKET_CLOSE
-
-
-def main(argv: list[str] | None = None) -> None:
-    p = argparse.ArgumentParser(
-        description="Download NSE option chain CSVs (LZMA-compressed) on a schedule."
-    )
-    p.add_argument("--out", default="data", type=Path, help="output folder (default: data)")
-    p.add_argument("--symbols", nargs="+", help="only these symbols, e.g. NIFTY ABB")
-    p.add_argument("--interval", type=int, default=300,
-                   help="seconds between cycle starts (default: 300)")
-    p.add_argument("--delay", type=float, default=1.0,
-                   help="seconds to wait between requests (default: 1.0)")
-    p.add_argument("--once", action="store_true", help="run a single cycle and exit")
-    p.add_argument("--ignore-market-hours", action="store_true",
-                   help="also run outside Mon-Fri 09:15-15:30 IST")
-    p.add_argument("-v", "--verbose", action="store_true")
-    args = p.parse_args(argv)
-
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
-    symbols = [s.upper() for s in args.symbols] if args.symbols else None
-    collector = Collector(args.out, symbols, args.delay)
-
-    if args.once:
-        collector.run_cycle()
-        return
-
-    log.info("Scheduler started: every %ss, output in %s", args.interval, args.out.resolve())
-    while True:
-        start = time.monotonic()
-        if args.ignore_market_hours or market_open(datetime.now(IST)):
-            try:
-                collector.run_cycle()
-            except Exception as e:
-                log.error("Cycle failed: %s", e)
-        else:
-            log.debug("Market closed, waiting")
-        time.sleep(max(5.0, args.interval - (time.monotonic() - start)))

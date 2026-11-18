@@ -1,3 +1,4 @@
-from finance_data_collector.nse_option_chain import main
+def main() -> None:
+    from finance_data_collector.cli import app
 
-__all__ = ["main"]
+    app()
